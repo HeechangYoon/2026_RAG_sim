@@ -1,0 +1,15 @@
+{
+  "model": "gpt-4.1-mini",
+  "temperature": 0.2,
+  "max_tokens": 1000,
+  "messages": [
+    {
+      "role": "system",
+      "content": "You are a scheduling analyst. Answer only using provided context. If evidence is insufficient, state uncertainty clearly."
+    },
+    {
+      "role": "user",
+      "content": "### USER QUESTION\nla01에서 제일 좋은 휴리스틱은?\n\n### RETRIEVED DOCUMENTS\n[DOC 1] instance=la01\ntitle=la01 | seq=SPT, route=FIFO, dispatch=SPT\ncontent=Instance la01 run summary. Sequencing=SPT, Routing=FIFO, Dispatching=SPT. Makespan=751.000. Completed jobs=10. Average completion time=532.500. Completion std=155.277. Recorded operations=50. Bottleneck machines: M5_1 util=0.887, busy=666.0; M1_1 util=0.811, busy=609.0; M2_1 util=0.714, busy=536.0.\n\n[DOC 2] instance=la01\ntitle=la01 | seq=SPT, route=FIFO, dispatch=FIFO\ncontent=Instance la01 run summary. Sequencing=SPT, Routing=FIFO, Dispatching=FIFO. Makespan=841.000. Completed jobs=10. Average completion time=595.200. Completion std=130.418. Recorded operations=50. Bottleneck machines: M5_1 util=0.792, busy=666.0; M1_1 util=0.724, busy=609.0; M2_1 util=0.637, busy=536.0.\n\n[DOC 3] instance=la01\ntitle=la01 | seq=FIFO, route=FIFO, dispatch=SPT\ncontent=Instance la01 run summary. Sequencing=FIFO, Routing=FIFO, Dispatching=SPT. Makespan=751.000. Completed jobs=10. Average completion time=532.500. Completion std=155.277. Recorded operations=50. Bottleneck machines: M5_1 util=0.887, busy=666.0; M1_1 util=0.811, busy=609.0; M2_1 util=0.714, busy=536.0.\n\n[DOC 4] instance=la01\ntitle=la01 | seq=FIFO, route=FIFO, dispatch=FIFO\ncontent=Instance la01 run summary. Sequencing=FIFO, Routing=FIFO, Dispatching=FIFO. Makespan=772.000. Completed jobs=10. Average completion time=609.900. Completion std=133.568. Recorded operations=50. Bottleneck machines: M5_1 util=0.863, busy=666.0; M1_1 util=0.789, busy=609.0; M2_1 util=0.694, busy=536.0.\n\n### BEST RUNS SNAPSHOT\n[RUN 1] instance=la01, seq=FIFO, route=FIFO, dispatch=SPT, makespan=751.0\n[RUN 2] instance=la01, seq=SPT, route=FIFO, dispatch=SPT, makespan=751.0\n[RUN 3] instance=la01, seq=FIFO, route=FIFO, dispatch=FIFO, makespan=772.0\n[RUN 4] instance=la01, seq=SPT, route=FIFO, dispatch=FIFO, makespan=841.0"
+    }
+  ]
+}
