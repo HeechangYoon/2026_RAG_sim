@@ -263,6 +263,9 @@ class OpenAISchedulingAgent(BaseSchedulingAgent):
         rag_ambiguity_threshold: float = 0.12,
         rag_bottleneck_threshold: float = 3.0,
         rag_score_threshold: float = 8.0,
+        rag_skip_threshold: float = 10.0,
+        rag_top2_gap_margin: float = 0.5,
+        rag_top2_score_threshold: float = 8.5,
     ):
         self.api_url = api_url
         self.api_key = api_key
@@ -287,6 +290,9 @@ class OpenAISchedulingAgent(BaseSchedulingAgent):
         self.rag_ambiguity_threshold = float(rag_ambiguity_threshold)
         self.rag_bottleneck_threshold = float(rag_bottleneck_threshold)
         self.rag_score_threshold = float(rag_score_threshold)
+        self.rag_skip_threshold = float(rag_skip_threshold)
+        self.rag_top2_gap_margin = float(rag_top2_gap_margin)
+        self.rag_top2_score_threshold = float(rag_top2_score_threshold)
         self.last_rag_debug: dict[str, Any] = {}
         self.last_query_error = None
         self.last_response_body = None
@@ -532,7 +538,7 @@ class OpenAISchedulingAgent(BaseSchedulingAgent):
             ranked.append((row, total_score, makespan))
 
         ranked.sort(key=lambda item: (item[1], item[2]))
-        return ranked[: self.rag_top_k]
+        return ranked[: max(self.rag_top_k, 2)]
 
     def _prefilter_dispatch_cases(
         self,
@@ -561,6 +567,60 @@ class OpenAISchedulingAgent(BaseSchedulingAgent):
         default_action: str | None,
     ) -> bool:
         return score <= self.rag_score_threshold
+
+    def _select_adaptive_dispatch_cases(
+        self,
+        ranked_cases: list[tuple[tuple[Any, ...], float, float]],
+    ) -> tuple[list[tuple[tuple[Any, ...], float, float]], dict[str, Any]]:
+        debug: dict[str, Any] = {
+            "adaptive_enabled": True,
+            "adaptive_k": 0,
+            "selection_reason": "no_ranked_cases",
+            "top1_score": None,
+            "top2_score": None,
+            "top12_gap": None,
+        }
+        if not ranked_cases:
+            return [], debug
+
+        top1 = ranked_cases[0]
+        top1_score = float(top1[1])
+        debug["top1_score"] = round(top1_score, 3)
+
+        if top1_score > self.rag_skip_threshold:
+            debug["selection_reason"] = "skip_bad_top1"
+            return [], debug
+
+        if len(ranked_cases) == 1:
+            if top1_score <= self.rag_score_threshold:
+                debug["adaptive_k"] = 1
+                debug["selection_reason"] = "use_top1_only"
+                return [top1], debug
+            debug["selection_reason"] = "skip_single_above_threshold"
+            return [], debug
+
+        top2 = ranked_cases[1]
+        top2_score = float(top2[1])
+        gap = top2_score - top1_score
+        debug["top2_score"] = round(top2_score, 3)
+        debug["top12_gap"] = round(gap, 3)
+
+        if top1_score <= self.rag_score_threshold and gap >= self.rag_top2_gap_margin:
+            debug["adaptive_k"] = 1
+            debug["selection_reason"] = "use_top1_clear_winner"
+            return [top1], debug
+
+        if (
+            top1_score <= self.rag_score_threshold
+            and top2_score <= self.rag_top2_score_threshold
+            and gap < self.rag_top2_gap_margin
+        ):
+            debug["adaptive_k"] = 2
+            debug["selection_reason"] = "use_top2_both_strong"
+            return ranked_cases[:2], debug
+
+        debug["selection_reason"] = "skip_low_confidence_margin"
+        return [], debug
 
     @staticmethod
     def _sort_numeric(values: list[float]) -> list[float]:
@@ -1377,6 +1437,9 @@ class OpenAISchedulingAgent(BaseSchedulingAgent):
             "rag_top_k": int(self.rag_top_k),
             "rag_prefilter_candidate_gap": int(self.rag_prefilter_candidate_gap),
             "rag_score_threshold": float(self.rag_score_threshold),
+            "rag_skip_threshold": float(self.rag_skip_threshold),
+            "rag_top2_gap_margin": float(self.rag_top2_gap_margin),
+            "rag_top2_score_threshold": float(self.rag_top2_score_threshold),
         }
         if not self.use_rag or not self.rag_db_path:
             self.last_rag_debug["reason"] = "disabled_or_missing_db_path"
@@ -1513,22 +1576,23 @@ class OpenAISchedulingAgent(BaseSchedulingAgent):
                             "score": round(float(top_score), 3),
                             "makespan": None if top_makespan == float("inf") else float(top_makespan),
                         }
-                    ranked_cases = []
-                    rejected_scores = []
-                    for row, score, makespan in ranked_cases_all:
-                        if self._should_accept_dispatch_case(row, score, state, candidates or [], default_action):
-                            ranked_cases.append((row, score, makespan))
-                        else:
-                            rejected_scores.append(round(float(score), 3))
+                    ranked_cases, adaptive_debug = self._select_adaptive_dispatch_cases(ranked_cases_all)
+                    accepted_scores = [round(float(score), 3) for _row, score, _makespan in ranked_cases]
+                    rejected_scores = [
+                        round(float(score), 3)
+                        for _row, score, _makespan in ranked_cases_all[len(ranked_cases):]
+                    ]
                     self.last_rag_debug["accepted_case_count"] = len(ranked_cases)
+                    self.last_rag_debug["accepted_scores"] = accepted_scores
                     self.last_rag_debug["rejected_scores"] = rejected_scores
+                    self.last_rag_debug.update(adaptive_debug)
                     conn.close()
                     if not ranked_cases:
                         self.last_rag_debug["reason"] = "no_ranked_cases_after_gate"
                         return ""
                     self.last_rag_debug["reason"] = "dispatch_case_selected"
                     self.last_rag_debug["used_rag"] = True
-                    return "\n".join(
+                    return "\n\n".join(
                         self._summarize_dispatch_case(row, score, state, candidates or [], default_action)
                         for row, score, _makespan in ranked_cases
                     )
