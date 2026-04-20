@@ -262,6 +262,7 @@ class OpenAISchedulingAgent(BaseSchedulingAgent):
         rag_conditional: bool = False,
         rag_ambiguity_threshold: float = 0.12,
         rag_bottleneck_threshold: float = 3.0,
+        rag_score_threshold: float = 8.0,
     ):
         self.api_url = api_url
         self.api_key = api_key
@@ -285,6 +286,8 @@ class OpenAISchedulingAgent(BaseSchedulingAgent):
         self.rag_conditional = rag_conditional
         self.rag_ambiguity_threshold = float(rag_ambiguity_threshold)
         self.rag_bottleneck_threshold = float(rag_bottleneck_threshold)
+        self.rag_score_threshold = float(rag_score_threshold)
+        self.last_rag_debug: dict[str, Any] = {}
         self.last_query_error = None
         self.last_response_body = None
         self.last_usage = None
@@ -337,6 +340,7 @@ class OpenAISchedulingAgent(BaseSchedulingAgent):
             "bottleneck_utilization": float(max_queue),
         }
 
+    @staticmethod
     def _state_decision_features(state: dict[str, Any], candidates: list[str]) -> dict[str, Any]:
         candidate_jobs = state.get("candidate_jobs", []) if isinstance(state.get("candidate_jobs"), list) else []
         proc_times = [float(row.get("proc_time_on_machine", 0.0) or 0.0) for row in candidate_jobs if isinstance(row, dict)]
@@ -547,6 +551,16 @@ class OpenAISchedulingAgent(BaseSchedulingAgent):
             if abs(state_candidate_count - case_candidate_count) <= self.rag_prefilter_candidate_gap:
                 filtered.append(row)
         return filtered if filtered else rows
+
+    def _should_accept_dispatch_case(
+        self,
+        row: tuple[Any, ...],
+        score: float,
+        state: dict[str, Any],
+        candidates: list[str],
+        default_action: str | None,
+    ) -> bool:
+        return score <= self.rag_score_threshold
 
     @staticmethod
     def _sort_numeric(values: list[float]) -> list[float]:
@@ -1353,13 +1367,26 @@ class OpenAISchedulingAgent(BaseSchedulingAgent):
         candidates: list[str] | None = None,
         default_action: str | None = None,
     ) -> str:
+        self.last_rag_debug = {
+            "enabled": bool(self.use_rag),
+            "rag_db_path": self.rag_db_path,
+            "decision_type": str(state.get("decision_type", "")).strip(),
+            "machine_type": str(state.get("machine_type", "")).strip(),
+            "candidate_count": len(candidates or []),
+            "default_action": default_action,
+            "rag_top_k": int(self.rag_top_k),
+            "rag_prefilter_candidate_gap": int(self.rag_prefilter_candidate_gap),
+            "rag_score_threshold": float(self.rag_score_threshold),
+        }
         if not self.use_rag or not self.rag_db_path:
+            self.last_rag_debug["reason"] = "disabled_or_missing_db_path"
             return ""
         try:
             conn = sqlite3.connect(self.rag_db_path)
             decision_type = str(state.get("decision_type", "")).strip()
             machine_type = str(state.get("machine_type", "")).strip()
             if decision_type == "dispatch" and not self._should_use_rag_for_dispatch(state, candidates or []):
+                self.last_rag_debug["reason"] = "rag_conditional_blocked"
                 conn.close()
                 return ""
             query_text = " ".join(
@@ -1418,8 +1445,11 @@ class OpenAISchedulingAgent(BaseSchedulingAgent):
                         """,
                         (max(self.rag_top_k * 40, 200),),
                     ).fetchall()
+                self.last_rag_debug["teacher_case_rows"] = len(case_rows)
+                self.last_rag_debug["teacher_query_machine_scoped"] = bool(machine_type)
 
                 if not case_rows:
+                    self.last_rag_debug["teacher_fallback_used"] = True
                     if machine_type:
                         case_rows = conn.execute(
                             """
@@ -1461,15 +1491,48 @@ class OpenAISchedulingAgent(BaseSchedulingAgent):
                             """,
                             (max(self.rag_top_k * 40, 200),),
                         ).fetchall()
+                    self.last_rag_debug["fallback_case_rows"] = len(case_rows)
+                else:
+                    self.last_rag_debug["teacher_fallback_used"] = False
 
                 if case_rows:
+                    raw_case_count = len(case_rows)
                     case_rows = self._prefilter_dispatch_cases(case_rows, state, candidates or [])
-                    ranked_cases = self._rank_dispatch_cases(case_rows, state, candidates or [])
+                    self.last_rag_debug["dispatch_case_rows_before_prefilter"] = raw_case_count
+                    self.last_rag_debug["dispatch_case_rows_after_prefilter"] = len(case_rows)
+                    ranked_cases_all = self._rank_dispatch_cases(case_rows, state, candidates or [])
+                    self.last_rag_debug["ranked_case_count"] = len(ranked_cases_all)
+                    self.last_rag_debug["ranked_scores"] = [
+                        round(float(score), 3) for _row, score, _makespan in ranked_cases_all
+                    ]
+                    if ranked_cases_all:
+                        top_row, top_score, top_makespan = ranked_cases_all[0]
+                        self.last_rag_debug["top_candidate"] = {
+                            "instance_name": str(top_row[0]) if len(top_row) > 0 else "",
+                            "machine_type": str(top_row[1]) if len(top_row) > 1 else "",
+                            "score": round(float(top_score), 3),
+                            "makespan": None if top_makespan == float("inf") else float(top_makespan),
+                        }
+                    ranked_cases = []
+                    rejected_scores = []
+                    for row, score, makespan in ranked_cases_all:
+                        if self._should_accept_dispatch_case(row, score, state, candidates or [], default_action):
+                            ranked_cases.append((row, score, makespan))
+                        else:
+                            rejected_scores.append(round(float(score), 3))
+                    self.last_rag_debug["accepted_case_count"] = len(ranked_cases)
+                    self.last_rag_debug["rejected_scores"] = rejected_scores
                     conn.close()
+                    if not ranked_cases:
+                        self.last_rag_debug["reason"] = "no_ranked_cases_after_gate"
+                        return ""
+                    self.last_rag_debug["reason"] = "dispatch_case_selected"
+                    self.last_rag_debug["used_rag"] = True
                     return "\n".join(
                         self._summarize_dispatch_case(row, score, state, candidates or [], default_action)
                         for row, score, _makespan in ranked_cases
                     )
+                self.last_rag_debug["reason"] = "no_dispatch_cases_found"
 
             memory_rows = []
             try:
@@ -1495,10 +1558,13 @@ class OpenAISchedulingAgent(BaseSchedulingAgent):
                     """,
                     (decision_type, max(self.rag_top_k * 3, self.rag_top_k)),
                 ).fetchall()
+            self.last_rag_debug["memory_rows"] = len(memory_rows)
 
             if memory_rows:
                 conn.close()
                 ranked_rows = sorted(memory_rows, key=lambda row: self._memory_rank_key(row, ""))[: self.rag_top_k]
+                self.last_rag_debug["reason"] = "memory_rows_selected"
+                self.last_rag_debug["used_rag"] = True
                 if decision_type == "dispatch":
                     return "\n".join(
                         f"[RAG_MEMORY] instance={row[0]}, decision_type={row[1]}\n{self._shorten_dispatch_memory(row[2])}"
@@ -1532,13 +1598,20 @@ class OpenAISchedulingAgent(BaseSchedulingAgent):
                     (self.rag_top_k,),
                 ).fetchall()
             conn.close()
+            self.last_rag_debug["chunk_rows"] = len(chunk_rows)
             if not chunk_rows:
+                self.last_rag_debug["reason"] = "no_chunk_rows_found"
                 return ""
+            self.last_rag_debug["reason"] = "chunk_rows_selected"
+            self.last_rag_debug["used_rag"] = True
             return "\n".join(
                 f"[RAG_CHUNK] instance={row[0]}, chunk={row[1]}\n{row[2]}"
                 for row in chunk_rows
             )
-        except Exception:
+        except Exception as exc:
+            self.last_rag_debug["reason"] = "exception"
+            self.last_rag_debug["exception_type"] = type(exc).__name__
+            self.last_rag_debug["exception_message"] = str(exc)
             return ""
 
     @staticmethod
@@ -1624,6 +1697,7 @@ class OpenAISchedulingAgent(BaseSchedulingAgent):
                     "query_error": self.last_query_error,
                     "response_body": self.last_response_body,
                     "usage": self.last_usage,
+                    "rag_debug": self.last_rag_debug,
                 }
             )
         if error is not None and self.fail_on_invalid_action:
