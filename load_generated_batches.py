@@ -37,6 +37,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--teacher-top-k", type=int, default=1)
     parser.add_argument("--ortools-max-time-sec", type=float, default=60.0)
     parser.add_argument("--ortools-require-optimal", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--ortools-spt-improve-ratio", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--significant-digits", type=int, default=10)
     parser.add_argument("--log-chunk-size", type=int, default=4000)
@@ -113,6 +114,8 @@ def build_db_command(args: argparse.Namespace, instance_names: list[str]) -> lis
         str(args.teacher_top_k),
         "--ortools-max-time-sec",
         str(args.ortools_max_time_sec),
+        "--ortools-spt-improve-ratio",
+        str(args.ortools_spt_improve_ratio),
         "--seed",
         str(args.seed),
         "--significant-digits",

@@ -1613,6 +1613,59 @@ def _insert_instance_features(
     )
 
 
+
+def _compute_heuristic_baseline_makespan(
+    instance_name: str,
+    problem_data: dict,
+    results_dir: Path,
+    sequencing_rule: str,
+    routing_rule: str,
+    dispatching_rule: str,
+    significant_digits: int,
+    seed: int,
+) -> float:
+    random.seed(seed)
+    baseline_log_path = (
+        results_dir
+        / f"{instance_name}__baseline__seq-{sequencing_rule}__route-{routing_rule}__dispatch-{dispatching_rule}.csv"
+    )
+    baseline_decision_path = (
+        results_dir
+        / f"{instance_name}__baseline__seq-{sequencing_rule}__route-{routing_rule}__dispatch-{dispatching_rule}__decision_trace.jsonl"
+    )
+    try:
+        if baseline_log_path.exists():
+            baseline_log_path.unlink()
+        if baseline_decision_path.exists():
+            baseline_decision_path.unlink()
+        agent = HeuristicSchedulingAgent(decision_log_path=str(baseline_decision_path))
+        monitor = run_simulation_stepwise(
+            problem_data=problem_data,
+            event_log_path=str(baseline_log_path),
+            sequencing_rule=sequencing_rule,
+            routing_rule=routing_rule,
+            dispatching_rule=dispatching_rule,
+            significant_digits=significant_digits,
+            agent=agent,
+        )
+        monitor.make_event_tracer()
+        monitor.save_event_tracer()
+        event_df = monitor.event_tracer.copy()
+        job_df = _extract_job_completion(event_df)
+        return _compute_makespan(event_df, job_df)
+    finally:
+        try:
+            if baseline_log_path.exists():
+                baseline_log_path.unlink()
+        except Exception:
+            pass
+        try:
+            if baseline_decision_path.exists():
+                baseline_decision_path.unlink()
+        except Exception:
+            pass
+
+
 def run_jssp_batch_to_db(
     dt_root: Path,
     db_path: Path,
@@ -1625,6 +1678,7 @@ def run_jssp_batch_to_db(
     teacher_source: str,
     ortools_max_time_sec: float | None,
     ortools_require_optimal: bool,
+    ortools_spt_improve_ratio: float,
     seed: int,
     significant_digits: int,
     force_convert: bool,
@@ -1640,6 +1694,7 @@ def run_jssp_batch_to_db(
     _init_db(conn)
 
     summary = {"success": 0, "failed": 0, "skipped": 0}
+    spt_baseline_cache: dict[str, float] = {}
 
     for instance_name in instance_names:
         source_txt_path = _resolve_raw_jssp_source(raw_jssp_dir, instance_name)
@@ -1740,6 +1795,28 @@ def run_jssp_batch_to_db(
                 job_df = _extract_job_completion(event_df)
                 makespan = _compute_makespan(event_df, job_df)
                 machine_df = _extract_machine_metrics(op_df, makespan)
+
+                if run_source == "ortools" and ortools_spt_improve_ratio > 0.0:
+                    baseline_makespan = spt_baseline_cache.get(instance_name)
+                    if baseline_makespan is None:
+                        baseline_makespan = _compute_heuristic_baseline_makespan(
+                            instance_name=instance_name,
+                            problem_data=problem_data,
+                            results_dir=results_dir,
+                            sequencing_rule="FIFO",
+                            routing_rule=DEFAULT_ROUTING_RULE,
+                            dispatching_rule="SPT",
+                            significant_digits=significant_digits,
+                            seed=seed,
+                        )
+                        spt_baseline_cache[instance_name] = baseline_makespan
+                    target_makespan = baseline_makespan * (1.0 - ortools_spt_improve_ratio)
+                    if makespan > target_makespan:
+                        raise RuntimeError(
+                            "teacher_threshold_not_met: "
+                            f"makespan={makespan:.3f} baseline_spt={baseline_makespan:.3f} "
+                            f"required_max={target_makespan:.3f} improve_ratio={ortools_spt_improve_ratio:.3f}"
+                        )
 
                 run_id = _insert_run_row(
                     conn=conn,
@@ -1908,6 +1985,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=False,
         help="Require OR-Tools to prove optimality instead of accepting the best feasible schedule.",
     )
+    parser.add_argument(
+        "--ortools-spt-improve-ratio",
+        type=float,
+        default=0.0,
+        help="Minimum relative makespan improvement over the heuristic SPT baseline required to accept an OR-Tools teacher run. Example: 0.05 means at least 5%% better than SPT.",
+    )
     parser.add_argument("--significant-digits", type=int, default=10)
     parser.add_argument("--log-chunk-size", type=int, default=DEFAULT_LOG_CHUNK_SIZE)
     parser.add_argument("--force-convert", action="store_true")
@@ -1966,6 +2049,7 @@ def main() -> None:
         teacher_source=args.teacher_source,
         ortools_max_time_sec=args.ortools_max_time_sec,
         ortools_require_optimal=args.ortools_require_optimal,
+        ortools_spt_improve_ratio=args.ortools_spt_improve_ratio,
         seed=args.seed,
         significant_digits=args.significant_digits,
         force_convert=args.force_convert,
